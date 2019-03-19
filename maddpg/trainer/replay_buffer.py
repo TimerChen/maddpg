@@ -1,5 +1,6 @@
 import numpy as np
 import random
+import pickle as pkl
 
 class ReplayBuffer(object):
     def __init__(self, size):
@@ -14,6 +15,19 @@ class ReplayBuffer(object):
         self._storage = []
         self._maxsize = int(size)
         self._next_idx = 0
+        self._save_count = 0
+
+    def save(self, save_dir, agent_id):
+        with open(save_dir + "exp_" + str(agent_id) + "_"
+                  + str(self._save_count) + ".pkl", "wb") as f:
+            pkl.dump(self._storage, f)
+            self._save_count = self._save_count + 1
+
+    def check_need_save(self):
+        if self._next_idx == 0:
+            return True
+        else:
+            return False
 
     def __len__(self):
         return len(self._storage)

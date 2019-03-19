@@ -6,6 +6,7 @@ import maddpg.common.tf_util as U
 from maddpg.common.distributions import make_pdtype
 from maddpg import AgentTrainer
 from maddpg.trainer.replay_buffer import ReplayBuffer
+from maddpg.trainer.maml import MAML
 
 
 def discount_with_dones(rewards, dones, gamma):
@@ -143,6 +144,7 @@ class MADDPGAgentTrainer(AgentTrainer):
             local_q_func=local_q_func,
             num_units=args.num_units
         )
+
         # Create experience buffer
         self.replay_buffer = ReplayBuffer(1e6)
         self.max_replay_buffer_len = args.batch_size * args.max_episode_len
@@ -158,7 +160,7 @@ class MADDPGAgentTrainer(AgentTrainer):
     def preupdate(self):
         self.replay_sample_index = None
 
-    def update(self, agents, t):
+    def update(self, agents, t, om=None):
         if len(self.replay_buffer) < self.max_replay_buffer_len: # replay buffer is not large enough
             return
         if not t % 100 == 0:  # only update every 100 steps
@@ -172,6 +174,9 @@ class MADDPGAgentTrainer(AgentTrainer):
         index = self.replay_sample_index
         for i in range(self.n):
             obs, act, rew, obs_next, done = agents[i].replay_buffer.sample_index(index)
+            if om is not None:
+                if i != self.agent_index:
+                    act = om.pred_i(obs, i)
             obs_n.append(obs)
             obs_next_n.append(obs_next)
             act_n.append(act)

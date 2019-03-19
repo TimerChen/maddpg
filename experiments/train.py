@@ -7,6 +7,7 @@ import pickle
 import maddpg.common.tf_util as U
 from maddpg.trainer.maddpg import MADDPGAgentTrainer
 import tensorflow.contrib.layers as layers
+from maddpg.trainer.maml import MAML
 
 def parse_args():
     parser = argparse.ArgumentParser("Reinforcement Learning experiments for multiagent environments")
@@ -23,9 +24,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1024, help="number of episodes to optimize at the same time")
     parser.add_argument("--num-units", type=int, default=64, help="number of units in the mlp")
     # Checkpointing
-    parser.add_argument("--exp-name", type=str, default=None, help="name of the experiment")
-    parser.add_argument("--save-dir", type=str, default="/tmp/policy/", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=1000, help="save model once every time this many episodes are completed")
+    parser.add_argument("--exp-name", type=str, default="default", help="name of the experiment")
+    parser.add_argument("--save-dir", type=str, default="./tmp/policy/", help="directory in which training state and model should be saved")
+    parser.add_argument("--save-rate", type=int, default=10, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
@@ -34,6 +35,10 @@ def parse_args():
     parser.add_argument("--benchmark-iters", type=int, default=100000, help="number of iterations run for benchmarking")
     parser.add_argument("--benchmark-dir", type=str, default="./benchmark_files/", help="directory where benchmark data is saved")
     parser.add_argument("--plots-dir", type=str, default="./learning_curves/", help="directory where plot data is saved")
+
+    # About Opponent Modeling
+    parser.add_argument("--use-maml", action="store_true", default=False)
+    parser.add_argument("--use-om", action="store_true", default=False)
     return parser.parse_args()
 
 def mlp_model(input, num_outputs, scope, reuse=False, num_units=64, rnn_cell=None):
@@ -74,6 +79,7 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
             local_q_func=(arglist.good_policy=='ddpg')))
     return trainers
 
+experience_save_dir = "./experiences/"
 
 def train(arglist):
     with U.single_threaded_session():
@@ -106,6 +112,16 @@ def train(arglist):
         train_step = 0
         t_start = time.time()
 
+        # Fuck this
+        # ??? obs_shape & num_action?
+        print("obs_shape", obs_shape_n)
+        obs_size = 0
+        for i in obs_shape_n:
+            obs_size = max(i[0], obs_size)
+        maml = MAML(U.get_session(), "", (obs_size,), 20, len(trainers))
+        merged = tf.summary.merge_all()
+        writer = tf.summary.FileWriter("logs/"+arglist.exp_name+"/", U.get_session().graph)
+
         print('Starting iterations...')
         while True:
             # get action
@@ -118,6 +134,10 @@ def train(arglist):
             # collect experience
             for i, agent in enumerate(trainers):
                 agent.experience(obs_n[i], action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
+                if agent.replay_buffer.check_need_save():
+                    agent.replay_buffer.save(experience_save_dir, i)
+            maml.store_data(obs_n, np.argmax(action_n, axis=1))
+
             obs_n = new_obs_n
 
             for i, rew in enumerate(rew_n):
@@ -125,6 +145,17 @@ def train(arglist):
                 agent_rewards[i][-1] += rew
 
             if done or terminal:
+                # Clear new experience in that one
+                maml.clear_new()
+                if arglist.use_maml > 0:
+                    maml.train(train_step)
+                    maml.update_real()
+
+                # Add add_summary
+                tf.summary.scalar('episode_rewards', episode_rewards[-1])
+                for i, agent in enumerate(trainers):
+                    tf.summary.scalar('agent_reward_{}'.format(i), agent_rewards[i][-1])
+
                 obs_n = env.reset()
                 episode_step = 0
                 episode_rewards.append(0)
@@ -158,10 +189,17 @@ def train(arglist):
             for agent in trainers:
                 agent.preupdate()
             for agent in trainers:
-                loss = agent.update(trainers, train_step)
+                if arglist.use_om:
+                    loss = agent.update(trainers, train_step, om=maml)
+                else:
+                    loss = agent.update(trainers, train_step)
+                    #tf.summary.scalar('agent_loss_{}', loss)
+            maml.train_real(episode_step)
+
 
             # save model, display training output
             if terminal and (len(episode_rewards) % arglist.save_rate == 0):
+
                 U.save_state(arglist.save_dir, saver=saver)
                 # print statement depends on whether or not there are adversaries
                 if num_adversaries == 0:
@@ -187,6 +225,12 @@ def train(arglist):
                     pickle.dump(final_ep_ag_rewards, fp)
                 print('...Finished total of {} episodes.'.format(len(episode_rewards)))
                 break
+
+            #writer.add_summary(U.get_session().run(maml.tfb), train_step)
+
+        for i, agent in enumerate(trainers):
+            if not agent.replay_buffer.check_need_save():
+                agent.replay_buffer.save(experience_save_dir+arglist.exp_name, i)
 
 if __name__ == '__main__':
     arglist = parse_args()
