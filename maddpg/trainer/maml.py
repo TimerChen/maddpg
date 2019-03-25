@@ -7,8 +7,9 @@ from maddpg.trainer.base import Net
 class MAML(Net):
     def __init__(self, sess, name, obs_shape, num_action,
                  num_agents,
-                 batch_size = 64, memory = None,
-                 theta=0.5, max_inner_epoch=50,
+                 batch_size = 64, maml_batch_size = 1024,
+                 memory = None,
+                 theta=0.5, max_inner_epoch=20,
                  memory_size=100,
                  useL2L=False,
                  lamb=1e-2,
@@ -27,6 +28,7 @@ class MAML(Net):
         self._lamb = lamb
 
         self._batch_size = batch_size
+        self._maml_batch_size = maml_batch_size
         self.max_inner_epoch = max_inner_epoch
         if memory is None:
             self._memory = [Memory(memory_size, obs_shape) for _ in range(num_agents)]
@@ -74,7 +76,6 @@ class MAML(Net):
             self.train_real_model = []
             self.real_loss = []
             self.real_output = []
-            self.tfb = []
 
             opt = tf.train.GradientDescentOptimizer(learning_rate = self.lr)
 
@@ -108,8 +109,6 @@ class MAML(Net):
                     self.train_real_model.append(opt.minimize(loss2))
                     self.real_output.append(output2)
                     self.real_loss.append(loss2)
-
-                    self.tfb.append(tf.summary.scalar('opponent_loss{}'.format(i), loss2))
 
 
                 #MAML Part
@@ -145,6 +144,8 @@ class MAML(Net):
 
 
     def _build_loss(self, output, y):
+        # y = y[:, :num_action]
+        # output = output[:, :num_action]
         loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits=output,labels=y))
         output = tf.nn.softmax(output)
         reg = self._lamb * tf.reduce_mean(tf.reduce_sum(output * tf.log(output+1e-6), axis=1))
@@ -164,8 +165,10 @@ class MAML(Net):
             self._new_memory[i].append(data[0], data[1])
 
     def pred_i(self, input, index):
-        return np.argmax(self.sess.run(self.real_output[index] + self.real_loss[index],
-                                feed_dict={self.real_x_ph[index]: input}))
+        sn = self.obs_shape[0] - input.shape[1]
+        input = np.pad(input, [(0, 0), (0, sn)], mode='constant')
+        return self.sess.run(self.real_output[index],
+                                feed_dict={self.real_x_ph[index]: input})
 
     def prediction(self, inputs):
         return self.sess.run(self.output, feed_dict = {self.x_placeholder: inputs})
@@ -235,14 +238,14 @@ class MAML(Net):
          self.x2_placeholder: x2, self.y2_placeholder: y2})
 
     def update_real(self):
-        self.sess.run( self.update_real_future)
+        self.sess.run(self.update_real_future)
         # self.train_real_model = []
         # self.real_loss)
 
     def train_real(self, epoch):
         _batch_size = min(self._batch_size, len(self._new_memory[0]))
-        if _batch_size == 0:
-            return None
+        if (_batch_size == 0) or (not epoch % 20 == 0):
+            return
         batch_num = (len(self._new_memory[0]) * 2) // _batch_size
         loss_record, grads_record = [], []
         mid_loss_record = [[] for _ in range(self.num_agents)]
@@ -285,13 +288,13 @@ class MAML(Net):
 
         return mid_loss
 
-
     def train(self, epoch):
-        if self._batch_size >= len(self._memory[0]):
-            #print(self._batch_size, len(self._memory[0]))
-            return None
+        _memory = self._new_memory
+        _batch_size = min(self._maml_batch_size, len(_memory[0]))
+        if (_batch_size == 0) or (not epoch % 50 == 0):
+            return None, None
 
-        batch_num = (len(self._memory[0]) * 2) // self._batch_size
+        batch_num = (len(_memory[0]) * 2) // _batch_size
         loss_record, grads_record = [], []
         mid_loss_record = [[] for _ in range(self.num_agents)]
 
@@ -306,13 +309,13 @@ class MAML(Net):
                 x, y = [], []
                 x2, y2 = [], []
                 for i in range(self.num_agents):
-                    batch = self._memory[i].sample(self._batch_size)
+                    batch = _memory[i].sample(_batch_size)
                     x.append(batch.states)
                     a = np.zeros((batch.actions.shape[0], self.num_action))
                     a[np.arange(batch.actions.shape[0]), batch.actions] = 1
                     y.append(a)
 
-                    batch = self._memory[i].sample(self._batch_size)
+                    batch = _memory[i].sample(_batch_size)
                     x2.append(batch.states)
                     a = np.zeros((batch.actions.shape[0], self.num_action))
                     a[np.arange(batch.actions.shape[0]), batch.actions] = 1
@@ -334,12 +337,12 @@ class MAML(Net):
             mid_loss = []
             for i in range(self.num_agents):
                 mid_loss.append(np.mean(mid_loss_record[i][-batch_num:]))
-            print("--- [opponent training] epoch #{:<4d} inner-epoch #{:<4d} loss: {:.3f}".format(epoch, inner_epoch, loss), end="\r")
+            #print("--- [opponent training] epoch #{:<4d} inner-epoch #{:<4d} loss: {:.3f}".format(epoch, inner_epoch, loss), end="\r")
 
             inner_epoch += 1
 
 
-        print("--- [opponent training] epoch #{:<4d} inner-epochs #{:<4d} mid-loss: {} final-loss: {:.3f}".format(epoch, inner_epoch, mid_loss, loss))
+        #print("--- [opponent training] epoch #{:<4d} inner-epochs #{:<4d} mid-loss: {} final-loss: {:.3f}".format(epoch, inner_epoch, mid_loss, loss))
 
         # grads_label = list(map(sum, zip(*grads_record)))
         new_var_list = self.sess.run(self._trainable_vars)

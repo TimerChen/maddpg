@@ -138,7 +138,7 @@ def minimize_and_clip(optimizer, objective, var_list, clip_val=10):
     """Minimized `objective` using `optimizer` w.r.t. variables in
     `var_list` while ensure the norm of the gradients for each
     variable is clipped to `clip_val`
-    """    
+    """
     if clip_val is None:
         return optimizer.minimize(objective, var_list=var_list)
     else:
@@ -161,8 +161,8 @@ def get_session():
 def make_session(num_cpu):
     """Returns a session that will use <num_cpu> CPU's only"""
     tf_config = tf.ConfigProto(
-        inter_op_parallelism_threads=num_cpu,
-        intra_op_parallelism_threads=num_cpu)
+        allow_soft_placement=True, log_device_placement=False)
+    tf_config.gpu_options.allow_growth = True
     return tf.Session(config=tf_config)
 
 
