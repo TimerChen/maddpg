@@ -27,7 +27,7 @@ def parse_args():
     # Checkpointing
     parser.add_argument("--exp-name", type=str, default="default", help="name of the experiment")
     parser.add_argument("--save-dir", type=str, default="./tmp/policy/", help="directory in which training state and model should be saved")
-    parser.add_argument("--save-rate", type=int, default=500, help="save model once every time this many episodes are completed")
+    parser.add_argument("--save-rate", type=int, default=50, help="save model once every time this many episodes are completed")
     parser.add_argument("--load-dir", type=str, default="", help="directory in which training state and model are loaded")
     # Evaluation
     parser.add_argument("--restore", action="store_true", default=False)
@@ -142,6 +142,7 @@ def train(arglist):
             summary_agent_reward_ph = []
             summary_total_reward_ph = []
             summary_opponent_loss_ph = []
+            summary_opponent_test_loss_ph = []
 
             summary_only_done = dict()
             summary_every_step = dict()
@@ -176,13 +177,26 @@ def train(arglist):
             # Loss of OM
             with tf.name_scope("opponnet"):
                 o_loss = []
+                t_loss = []
                 for i in range(env.n):
                     loss = tf.placeholder(tf.float32, None)
                     summary_opponent_loss_ph.append(loss)
                     loss = tf.summary.scalar("agent_{}_loss".format(i), loss)
                     o_loss.append(loss)
+
+                    loss = tf.placeholder(tf.float32, None)
+                    summary_opponent_test_loss_ph.append(loss)
+                    loss = tf.summary.scalar("agent_{}_test_loss".format(i), loss)
+                    t_loss.append(loss)
+
+                summary_opponent_total_test_loss_ph = \
+                loss = tf.placeholder(tf.float32, None)
+                loss = tf.summary.scalar("total_test_loss".format(i), loss)
+
                 if arglist.use_om:
                     summary_only_done["opponnet_loss"] = o_loss
+                    summary_only_done["opponnet_test_loss"] = t_loss
+                    summary_only_done["opponnet_total_test_loss"] = [loss]
 
             # Loss of maml
             loss = tf.placeholder(tf.float32, None)
@@ -205,69 +219,79 @@ def train(arglist):
 
         first_update = False
 
+        def gather_experiences(num_episodes, store_func):
+            nonlocal episode_step, train_step, obs_n
+            for ii in range(num_episodes):
+                while True:
+                    # get action
+                    action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
+                    # environment step
+                    # print("action: ", action_n, np.sum(action_n, axis=1))
+                    new_obs_n, rew_n, done_n, info_n = env.step(action_n)
+                    episode_step += 1
+                    done = all(done_n)
+                    terminal = (episode_step >= arglist.max_episode_len)
+                    # collect experience
+                    for i, agent in enumerate(trainers):
+                        agent.experience(obs_n[i], action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
+                        if agent.replay_buffer.check_need_save():
+                            agent.replay_buffer.save(experience_save_dir, i)
+                    # maml.store_data
+                    store_func(obs_n, action_n)
+
+                    obs_n = new_obs_n
+
+                    for i, rew in enumerate(rew_n):
+                        episode_rewards[-1] += rew
+                        agent_rewards[i][-1] += rew
+
+                    # for benchmarking learned policies
+                    if arglist.benchmark:
+                        for i, info in enumerate(info_n):
+                            agent_info[-1][i].append(info_n['n'])
+                        if train_step > arglist.benchmark_iters and (done or terminal):
+                            file_name = arglist.benchmark_dir + arglist.exp_name + '.pkl'
+                            print('Finished benchmarking, now saving...')
+                            with open(file_name, 'wb') as fp:
+                                pickle.dump(agent_info[:-1], fp)
+                            break
+                        continue
+
+                    # for displaying learned policies
+                    if arglist.display:
+                        time.sleep(0.1)
+                        env.render()
+                        continue
+
+                    if done or terminal:
+                        obs_n = env.reset()
+                        episode_step = 0
+                        break
+
         print('Starting iterations...')
         while True:
-            # get action
-            action_n = [agent.action(obs) for agent, obs in zip(trainers,obs_n)]
-            # environment step
-            new_obs_n, rew_n, done_n, info_n = env.step(action_n)
-            episode_step += 1
-            done = all(done_n)
-            terminal = (episode_step >= arglist.max_episode_len)
-            # collect experience
-            for i, agent in enumerate(trainers):
-                agent.experience(obs_n[i], action_n[i], rew_n[i], new_obs_n[i], done_n[i], terminal)
-                if agent.replay_buffer.check_need_save():
-                    agent.replay_buffer.save(experience_save_dir, i)
-            maml.store_data(obs_n, np.argmax(action_n, axis=1))
-
-            obs_n = new_obs_n
-
-            for i, rew in enumerate(rew_n):
-                episode_rewards[-1] += rew
-                agent_rewards[i][-1] += rew
-
-            if done or terminal:
-                # if arglist.use_om:
-                #     print("[step: {}] OM loss: {}".format(train_step, mid_loss))
-                # Summary writer
-                feed_dict = dict()
-                feed_dict[summary_total_reward_ph] = episode_rewards[-1]
-                for i in range(num_agents):
-                    feed_dict[summary_agent_reward_ph[i]] = agent_rewards[i][-1]
-
-                summary_tmp = summary_only_done["agent_rewards"] + [summary_only_done["total_reward"]]
-                write_summary(writer, summary_tmp, feed_dict, train_step)
-
-                obs_n = env.reset()
-                episode_step = 0
-                episode_rewards.append(0)
-                for a in agent_rewards:
-                    a.append(0)
-                agent_info.append([[]])
-
-            # increment global step counter
             train_step += 1
+            # MAML data
+            gather_experiences(3, maml.store_data)
 
-            # for benchmarking learned policies
-            if arglist.benchmark:
-                for i, info in enumerate(info_n):
-                    agent_info[-1][i].append(info_n['n'])
-                if train_step > arglist.benchmark_iters and (done or terminal):
-                    file_name = arglist.benchmark_dir + arglist.exp_name + '.pkl'
-                    print('Finished benchmarking, now saving...')
-                    with open(file_name, 'wb') as fp:
-                        pickle.dump(agent_info[:-1], fp)
-                    break
-                continue
+            # Train MAML
+            if arglist.use_maml and first_update:
+                maml_loss, _ = maml.train(train_step)
+                if maml_loss is not None:
+                    maml.update_real()
 
-            # for displaying learned policies
-            if arglist.display:
-                time.sleep(0.1)
-                env.render()
-                continue
+                    # Summary writer
+                    feed_dict = dict()
+                    feed_dict[summary_maml_loss_ph] = maml_loss
+                    summary_tmp = summary_only_done["maml_loss"]
+                    write_summary(writer, summary_tmp, feed_dict, train_step)
 
-            # Update Each one
+                    maml.clear_new()
+
+            # Trainning data
+            gather_experiences(1, maml.store_data)
+
+            # Training
             mid_loss = 0
             if arglist.use_om and first_update:
                 mid_loss = maml.train_real(train_step)
@@ -282,7 +306,34 @@ def train(arglist):
                     summary_tmp = summary_only_done["opponnet_loss"]
                     write_summary(writer, summary_tmp, feed_dict, train_step)
 
-            # update all trainers, if not in display or benchmark mode
+            # Evaluation
+            gather_experiences(2, maml.store_test_data)
+            if arglist.use_om and first_update:
+                loss = maml.evaluate()
+                if loss is not None:
+                    # Summary writer
+                    feed_dict = dict()
+                    for i in range(num_agents):
+                        feed_dict[summary_opponent_test_loss_ph[i]] = loss[1][i]
+                    feed_dict[summary_opponent_total_test_loss_ph] = loss[0]
+                    summary_tmp = summary_only_done["opponnet_total_test_loss"] + summary_only_done["opponnet_test_loss"]
+                    write_summary(writer, summary_tmp, feed_dict, train_step)
+
+            # Summary writer of Data
+            feed_dict = dict()
+            feed_dict[summary_total_reward_ph] = episode_rewards[-1]
+            for i in range(num_agents):
+                feed_dict[summary_agent_reward_ph[i]] = agent_rewards[i][-1]
+
+            summary_tmp = summary_only_done["agent_rewards"] + [summary_only_done["total_reward"]]
+            write_summary(writer, summary_tmp, feed_dict, train_step)
+
+            episode_rewards.append(0)
+            for a in agent_rewards:
+                a.append(0)
+            agent_info.append([[]])
+
+            # Update Each Agent
             loss = None
             for agent in trainers:
                 agent.preupdate()
@@ -298,7 +349,6 @@ def train(arglist):
                         print("First update!!!")
                     agent_qloss[i].append(loss[0])
                     agent_ploss[i].append(loss[1])
-                    maml.clear_new()
 
             if loss is not None:
                 # Summary writer
@@ -309,21 +359,8 @@ def train(arglist):
                 summary_tmp = summary_only_done["agent_qloss"] + summary_only_done["agent_ploss"]
                 write_summary(writer, summary_tmp, feed_dict, train_step)
 
-            # Update Maml
-            if arglist.use_maml and first_update:
-                maml_loss, _ = maml.train(train_step)
-                if maml_loss is not None:
-                    maml.update_real()
-
-                    # Summary writer
-                    feed_dict = dict()
-                    feed_dict[summary_maml_loss_ph] = maml_loss
-                    summary_tmp = summary_only_done["maml_loss"]
-                    write_summary(writer, summary_tmp, feed_dict, train_step)
-
-
             # save model, display training output
-            if terminal and (len(episode_rewards) % arglist.save_rate == 0):
+            if (len(episode_rewards) % arglist.save_rate == 0):
 
                 U.save_state(arglist.save_dir, saver=saver)
                 # print statement depends on whether or not there are adversaries
@@ -352,9 +389,9 @@ def train(arglist):
                 break
 
 
-        for i, agent in enumerate(trainers):
-            if not agent.replay_buffer.check_need_save():
-                agent.replay_buffer.save(experience_save_dir+arglist.exp_name, i)
+        # for i, agent in enumerate(trainers):
+        #     if not agent.replay_buffer.check_need_save():
+        #         agent.replay_buffer.save(experience_save_dir+arglist.exp_name, i)
 
 
 if __name__ == '__main__':

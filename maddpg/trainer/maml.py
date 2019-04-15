@@ -9,11 +9,12 @@ class MAML(Net):
                  num_agents,
                  batch_size = 64, maml_batch_size = 1024,
                  memory = None,
-                 theta=0.5, max_inner_epoch=20,
+                 theta=0.01, max_inner_epoch=20,
                  memory_size=100,
                  useL2L=False,
                  lamb=1e-2,
-                 dim_hidden = 32, num_layers = 2, lr = 0.01):
+                 maml_step=4,
+                 dim_hidden=32, num_layers=2, lr=0.01):
         self.theta = theta
         self.dim_hidden = [dim_hidden]*num_layers
         self.dim_input = obs_shape[0]
@@ -24,6 +25,7 @@ class MAML(Net):
         self.final_loss = None
         self.lr = lr
         self.useL2L = False
+        self._maml_step = maml_step
 
         self._lamb = lamb
 
@@ -31,8 +33,9 @@ class MAML(Net):
         self._maml_batch_size = maml_batch_size
         self.max_inner_epoch = max_inner_epoch
         if memory is None:
-            self._memory = [Memory(memory_size, obs_shape) for _ in range(num_agents)]
-            self._new_memory = [Memory(memory_size, obs_shape) for _ in range(num_agents)]
+            self._memory = [Memory(memory_size, obs_shape, (num_action,)) for _ in range(num_agents)]
+            self._new_memory = [Memory(memory_size, obs_shape, (num_action,)) for _ in range(num_agents)]
+            self._test_memory = [Memory(memory_size, obs_shape, (num_action,)) for _ in range(num_agents)]
         else:
             if not isinstance(memory, list) and num_agents == 1:
                 self._memory = [memory]
@@ -51,10 +54,49 @@ class MAML(Net):
 
     def _build(self):
 
+        opt = tf.train.GradientDescentOptimizer(learning_rate = self.lr)
+
+        def build_maml(inp):
+            input, label, x2, y2 = inp
+            print("input:", input)
+            # self.tmp = input
+            with tf.name_scope("model"):
+                output = forward_fc(input, self.model_weights, len(self.dim_hidden))
+
+                # label = self.y_placeholder[i]
+                loss = self._build_loss(output, label)
+
+            # MAML Part
+            meta_train_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self._global_scope)
+            meta_loss = loss
+
+            # with tf.name_scope("future"):
+            for s_i in range(self._maml_step):
+                gs = opt.compute_gradients(meta_loss, meta_train_vars)
+                future_weights = {}
+                with tf.name_scope("g_step{}".format(s_i)):
+                    for g, ref in gs:
+                        if g is None:
+                            continue
+                        delta = +self.theta*g
+                        old_name = ref.name.split('/')[-1].split(':')[0]
+                        f_ref = tf.add(ref, delta, name=old_name)
+                        future_weights[old_name] = f_ref
+
+                    # Future model
+                    input2 = x2
+                    output2 = forward_fc(input2, future_weights, len(self.dim_hidden))
+                    label2 = y2
+                    meta_loss = loss2 = self._build_loss(output2, label2)
+
+                    meta_train_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+                                                    scope=tf.get_variable_scope().name)
+            return (loss, loss2)
+
         with tf.variable_scope("maml_{}".format(self._name)):
             self.scope = self._global_scope = tf.get_variable_scope().name # ?
 
-            #place holders
+            # place holders
             self.x_placeholder = tf.placeholder(tf.float32, shape=(self.num_agents, None,) + self.obs_shape)
             self.y_placeholder = tf.placeholder(tf.float32, shape=(self.num_agents, None, self.num_action))
             self.x2_placeholder = tf.placeholder(tf.float32, shape=(self.num_agents, None,) + self.obs_shape)
@@ -64,7 +106,7 @@ class MAML(Net):
 
             print("ph_shape:", (self.num_agents, None,) + self.obs_shape, (self.num_agents, None, self.num_action))
 
-            #Origin Model
+            # Origin Model
             self.model_weights = construct_fc_weights(self.dim_input, self.dim_hidden, self.num_action)
             self.output = []
             self.loss = []
@@ -77,30 +119,17 @@ class MAML(Net):
             self.real_loss = []
             self.real_output = []
 
-            opt = tf.train.GradientDescentOptimizer(learning_rate = self.lr)
-
             self.tmp = None
+            self._trainable_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self._global_scope)
 
             for i in range(self.num_agents):
-
-                input = self.x_placeholder[i]
-                self.tmp = input
-                with tf.name_scope("model{}".format(i)):
-                    output = forward_fc(input, self.model_weights, len(self.dim_hidden))
-
-                    label = self.y_placeholder[i]
-                    loss = self._build_loss(output, label)
-                    self.output.append(output)
-                    self.loss.append(loss)
-
-
-                #Real Future Models
+                # Real Future Models
                 with tf.name_scope("real_future{}".format(i)):
                     real_future_weights = construct_fc_weights(self.dim_input, self.dim_hidden, self.num_action)
                     for k in self.model_weights:
                         self.update_real_future.append(tf.assign(self.model_weights[k], real_future_weights[k]))
 
-                    #Future model
+                    # Future model
                     input2 = tf.reshape(self.real_x_ph[i], shape = (-1,) + self.obs_shape)
                     output2 = forward_fc(input2, real_future_weights, len(self.dim_hidden))
                     label2 = tf.reshape(self.real_y_ph[i], shape = (-1, self.num_action))
@@ -110,38 +139,16 @@ class MAML(Net):
                     self.real_output.append(output2)
                     self.real_loss.append(loss2)
 
-
-                #MAML Part
-                self._trainable_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self._global_scope)
-                gs = opt.compute_gradients(loss, self._trainable_vars)
-                future_weights = {}
-                with tf.name_scope("future{}".format(i)):
-                    for g, ref in gs:
-                        #print(g, ref)
-                        if g is None:
-                            continue
-                        delta = +self.theta*g
-                        old_name = ref.name.split('/')[-1].split(':')[0]
-                        #print("{} -> {}".format(ref.name, old_name))
-                        f_ref = tf.add(ref, delta, name=old_name)
-                        future_weights[old_name] = f_ref
-
-                    #Future model
-                    input2 = tf.reshape(self.x2_placeholder[i], shape = (-1,) + self.obs_shape)
-                    output2 = forward_fc(input2, future_weights, len(self.dim_hidden))
-                    label2 = tf.reshape(self.y2_placeholder[i], shape = (-1, self.num_action))
-                    loss2 = self._build_loss(output2, label2)
-
-
-
-                self.future_weights.append(future_weights)
-                self.loss2.append(loss2)
+            maml_input = (self.x_placeholder, self.y_placeholder, self.x2_placeholder, self.y2_placeholder)
+            maml_output_shape = (tf.float32, tf.float32,)
+            maml_results = tf.map_fn(fn = build_maml, elems = maml_input, dtype=maml_output_shape)
+            self.loss, self.loss2 = maml_results
+            self._trainable_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self._global_scope)
 
             self.mid_loss = tf.reduce_mean(self.loss)
             self.final_loss = tf.reduce_mean(self.loss2)
             self._grads, self._train_op = self._optimize(self.final_loss)
             _, self._mid_train_op = self._optimize(self.mid_loss)
-
 
     def _build_loss(self, output, y):
         # y = y[:, :num_action]
@@ -158,11 +165,16 @@ class MAML(Net):
     def clear_new(self):
         for i in range(self.num_agents):
             self._new_memory[i].clear()
+            self._test_memory[i].clear()
 
     def store_data(self, states, actions):
         for i, data in enumerate(zip(states, actions)):
             self._memory[i].append(data[0], data[1])
             self._new_memory[i].append(data[0], data[1])
+
+    def store_test_data(self, states, actions):
+        for i, data in enumerate(zip(states, actions)):
+            self._test_memory[i].append(data[0], data[1])
 
     def pred_i(self, input, index):
         sn = self.obs_shape[0] - input.shape[1]
@@ -171,53 +183,27 @@ class MAML(Net):
                                 feed_dict={self.real_x_ph[index]: input})
 
     def prediction(self, inputs):
-        return self.sess.run(self.output, feed_dict = {self.x_placeholder: inputs})
+        #return self.sess.run(self.output, feed_dict = {self.x_placeholder: inputs})
+        return
 
     def act(self, state, eps):
         inputs = [state] * self.num_agents
         return self.prediction(inputs)
 
-    def evaluate(self, epoch):
-        if self._batch_size >= len(self._memory[0]):
-            #print(self._batch_size, len(self._memory[0]))
-            return 0.0
+    def evaluate(self):
+        if len(self._test_memory[0]) <= 0:
+            return None
+        _batch_size = len(self._test_memory[0])
+        all_loss = []
+        for i in range(self.num_agents):
+            batch = self._test_memory[i].sample(_batch_size)
+            y = self.pred_i(batch.states, i)
+            tmp = np.square(y-batch.actions)
+            tmp = np.sqrt(np.mean(tmp, axis=1))
+            tmp = np.mean(tmp)
+            all_loss.append(tmp)
 
-        batch_num = (len(self._memory[0]) * 2) // self._batch_size
-        loss_record, grads_record = [], []
-
-        loss, loss_margin = float("inf"), 0.01
-
-        # init theta
-        #init_var_list = self.sess.run(self._trainable_vars)
-        inner_epoch = 0
-        max_inner_epoch = self.max_inner_epoch*10
-
-        while loss > loss_margin and inner_epoch < max_inner_epoch:
-            for b in range(batch_num):
-                x, y = [], []
-                #x2, y2 = [], []
-                for i in range(self.num_agents):
-                    batch = self._memory[i].sample(self._batch_size)
-                    x.append(batch.states)
-                    a = np.zeros((batch.actions.shape[0], self.num_action))
-                    a[np.arange(batch.actions.shape[0]), batch.actions] = 1
-                    y.append(a)
-
-                _, loss = self.sess.run([self._mid_train_op, self.mid_loss], feed_dict={
-                    self.x_placeholder: x, self.y_placeholder: y,
-                    #self.x2_placeholder: x2, self.y2_placeholder: y2
-                })
-                #print("--- [opponent evaluate] batch #{:<4d} loss {:<4.3f}".format(b, loss), end="\r")
-                loss_record.append(loss)
-
-            loss = np.mean(loss_record[-batch_num:])
-            print("+++ [opponent evaluate] epoch #{:<4d} inner-epoch #{:<4d} loss: {:.3f}".format(epoch, inner_epoch, loss), end="\r")
-
-            inner_epoch += 1
-
-        print("+++ [opponent evaluate] epoch #{:<4d} inner-epochs #{:<4d} final-loss: {:.3f}".format(epoch, inner_epoch, loss))
-        mean_loss = np.mean(loss_record)
-        return mean_loss
+        return np.mean(all_loss), all_loss
 
     def _optimize(self, loss, optimizer=None):
         if optimizer is None:
@@ -244,7 +230,8 @@ class MAML(Net):
 
     def train_real(self, epoch):
         _batch_size = min(self._batch_size, len(self._new_memory[0]))
-        if (_batch_size == 0) or (not epoch % 20 == 0):
+        #if (_batch_size == 0) or (not epoch % 20 == 0):
+        if (_batch_size == 0):
             return
         batch_num = (len(self._new_memory[0]) * 2) // _batch_size
         loss_record, grads_record = [], []
@@ -262,10 +249,9 @@ class MAML(Net):
                 fdict = {}
                 for i in range(self.num_agents):
                     batch = self._new_memory[i].sample(_batch_size)
-                    a = np.zeros((batch.actions.shape[0], self.num_action))
-                    a[np.arange(batch.actions.shape[0]), batch.actions] = 1
+                    # a[np.arange(batch.actions.shape[0]), batch.actions] = 1
                     fdict[self.real_x_ph[i]] = batch.states
-                    fdict[self.real_y_ph[i]] = a
+                    fdict[self.real_y_ph[i]] = batch.actions
 
                 res = self.sess.run(self.real_loss + self.train_real_model, feed_dict=fdict)
                 loss = res[:len(self.real_loss)]
@@ -291,7 +277,8 @@ class MAML(Net):
     def train(self, epoch):
         _memory = self._new_memory
         _batch_size = min(self._maml_batch_size, len(_memory[0]))
-        if (_batch_size == 0) or (not epoch % 50 == 0):
+        #if (_batch_size == 0) or (not epoch % 50 == 0):
+        if (_batch_size == 0):
             return None, None
 
         batch_num = (len(_memory[0]) * 2) // _batch_size
@@ -311,24 +298,28 @@ class MAML(Net):
                 for i in range(self.num_agents):
                     batch = _memory[i].sample(_batch_size)
                     x.append(batch.states)
-                    a = np.zeros((batch.actions.shape[0], self.num_action))
-                    a[np.arange(batch.actions.shape[0]), batch.actions] = 1
-                    y.append(a)
+                    # a = np.zeros((batch.actions.shape[0], self.num_action))
+                    # a[np.arange(batch.actions.shape[0]), batch.actions] = 1
+                    y.append(batch.actions)
 
                     batch = _memory[i].sample(_batch_size)
                     x2.append(batch.states)
-                    a = np.zeros((batch.actions.shape[0], self.num_action))
-                    a[np.arange(batch.actions.shape[0]), batch.actions] = 1
-                    y2.append(a)
+                    # a = np.zeros((batch.actions.shape[0], self.num_action))
+                    # a[np.arange(batch.actions.shape[0]), batch.actions] = 1
+                    y2.append(batch.actions)
 
-                res = self.sess.run([self._train_op, self.final_loss, self._grads] + self.loss, feed_dict={
+                # def pit(it):
+                #     return [iit.shape for iit in it]
+
+                res = self.sess.run([self._train_op, self.final_loss, self._grads, self.loss, self.loss2], feed_dict={
                     self.x_placeholder: x, self.y_placeholder: y,
                     self.x2_placeholder: x2, self.y2_placeholder: y2
                 })
                 _, loss, grads = res[:3]
                 # print("--- [opponent training] batch #{:<4d} loss {:<4.3f}".format(b, loss), end="\r")
+                #print("loss:", res[3], "loss2:", res[4])
                 for i in range(self.num_agents):
-                    mid_loss_record[i].append(res[i+3])
+                    mid_loss_record[i].append(res[3][i])
                 loss_record.append(loss)
                 grads_record.append(grads)
 

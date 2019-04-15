@@ -88,19 +88,20 @@ class LoopBuffer(object):
 
 
 class Memory(LoopBuffer):
-    def __init__(self, capacity, state_space):
+    def __init__(self, capacity, state_space, action_space):
         super(Memory, self).__init__(capacity)
 
         self._state = np.zeros((capacity,) + state_space, dtype=np.float32)
-        self._act = np.zeros((capacity,), dtype=np.int32)
+        self._act = np.zeros((capacity,) + action_space, dtype=np.float32)
 
     def append(self, state, action):
         cur = self.index
 
         sn = self._state.shape[1] - state.shape[0]
+        an = self._act.shape[1] - action.shape[0]
 
         self._state[cur] = np.pad(state, (0, sn), mode='constant')
-        self._act[cur] = action
+        self._act[cur] = np.pad(action, (0, an), mode='constant')
 
         super(Memory, self).append()
 
